@@ -1,0 +1,1274 @@
+---
+title: "MUChem Documentation"
+author: "Mitch Fairweather, Amy Hu"
+date: "2/24/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Reading in the Files and packages
+
+``` {r packages}
+pacman::p_load(tidyverse, readxl, magrittr, DataExplorer,reshape2, ggplot2, smotefamily,naniar, caret, doParallel, randomForest, VIM, optmatch, reticulate,pROC, RVerbalExpressions)
+
+```
+
+```{r ReadingData}
+DataSetFull <- read_excel("C:\\MUChemistry\\DataSets\\Original Data\\FullDataSet.xls") 
+colnames(DataSetFull) <- c("MoleculeName", "Structure", "CDDNumber", "SMILE", "PlateName", "PlateWell", "RFU", "PercentInh")
+
+DataSetFull %<>% select(SMILE, PercentInh) %<>% subset(!is.na(SMILE)) %<>% subset(!is.na(PercentInh))
+
+
+IC50DataSet <- read_excel("C:\\MUChemistry\\DataSets\\Original Data\\3-9-20CrowderInhibitors.xlsx", range = cell_cols("B:C"), na = "NA")
+colnames(IC50DataSet) <- c("SMILE", "IC50")
+
+IC50DataSet %<>% subset(!is.na(SMILE)) %<>% subset(!is.na(IC50))
+
+```
+Notes: 
+- There are two files that are to be read in preliminarily. These include the two data sets given to us from the MU Chemistry department: the ~1000 observations with IC50 values, and ~44000 observations with Percent Inhibition values. 
+### Preliminary Data Cleaning
+
+``` {r PrelimDataCleaning}
+
+# remove > and make them 100
+IC50DataSet$IC50<-as.numeric(gsub("[\\>]", "100", IC50DataSet$IC50))
+# remove observations greater than -50
+DataSetFull %<>% subset(PercentInh > -50)
+
+```
+
+Notes: 
+- From the data set with IC50 values as the response variable, there were several observations that were listed as having an IC50 value of ">10" or ">100". We removed this character, and replaced it with a numerical value to ensure these observations are later coded to being "bad". 
+- Per Toby, in the data set with RFU and percent inhibition, there are many observations that have negative values for percent inhibition. The values that are less than 50% were measurement errors, so we removed these from the data set. The other negative values are valid, and are 100% known to be "bad" inhibitors. 
+- There are 631 missing data points for percent inhibition in our DataSetFull. When subsetting it for values only greater than -50, it automatically removes these without having to specifically filter out NA's. 
+
+### Combining the Two Datasets  
+
+``` {r CombiningDataSets}
+
+DataSetFull %>% select("SMILE", "PercentInh") %>%
+  mutate(IC50 = NA) %>%
+  mutate(Response = ifelse(PercentInh >= 50, "Good", "Bad")) -> SubsetDataSetFull
+
+IC50DataSet %>% mutate(PercentInh = NA) %>% 
+  mutate(Response = ifelse(IC50 <= 10, "Good", "Bad"))-> SubsetIC50DataSet
+
+CombineDataSet <- rbind(SubsetDataSetFull, SubsetIC50DataSet)
+CombineDataSet$Response %<>% as.factor()
+
+
+#####################
+
+temp1 <- CombineDataSet[which(duplicated(CombineDataSet$SMILE)),]
+temp2 <- subset(CombineDataSet, SMILE %in% temp1$SMILE)
+
+yGood <- subset(temp2, Response == "Good")
+yBad <- subset(temp2, Response == "Bad")
+
+BadSmiles <- vector()
+i <- seq(1:nrow(yGood))
+
+for (val in i) {
+  if(is_in(yGood$SMILE[i], yBad$SMILE)){
+    BadSmiles[i] = yGood$SMILE[i]
+  }
+}
+
+BadSmiles %<>% as.data.frame() %>% distinct()
+colnames(BadSmiles) <- "SMILE"
+
+CombineDataSet <- subset(CombineDataSet, !(SMILE %in% BadSmiles$SMILE))
+
+
+```
+
+### Cut-Off Values To Determine "Good" and "Bad" 
+The cut-off to determine "good" for SMILES with IC50 is less than or equal to 10. The cut-off to determine "good" for SMILES with  percent inhibition is greater than or equal to 50%. We removed SMILES with RFU and percent inhibition less than or equal to -50%.
+
+### Missing Response Variable or SMILE 
+``` {r MissingResponseSMILE}
+
+CombineDataSet %<>% select(SMILE, Response)
+CombineDataSet %<>% na.omit()
+
+# This combine data set is what needs to be run through Alvadesc.
+# write.table(CombineDataSet[,1], file =
+#         "C:\\MUChemistry\\DataSets\\AlvadescImport.txt",
+#        sep = ",",
+#       col.names = F,
+#      row.names = F)
+
+```
+
+
+Notes: 
+- In the full data set with RFU and Percent inhibition, there was a single observation that had a missing SMILE. We removed this. 
+- There are also many observations that had missing PercentInhibition or missing IC50 values. We removed these as well. 
+
+### Combining AlvaDesc Descriptors with the Response 
+```{r CombiningAlvaDesc}
+AlvadescData <- read.delim("C:\\MUChemistry\\DataSets\\AlvaDescExport (3-10-20).txt", sep = "\t",na.strings = c("na", "NA", "Na", "", " "))
+
+#AlvadescData <- cbind(CombineDataSet[,1], AlvadescData)
+
+AlvadescWithResponse <- cbind(CombineDataSet, AlvadescData) %>% select(-No., -NAME)
+
+# # caret package
+# CombineDataSet %<>% mutate(No. = seq.int(nrow(CombineDataSet))) %<>%
+#   mutate(NAME = paste("Molecule", No., sep = ""))
+# 
+# #This works! 
+# AlvadescWithResponse <- merge(CombineDataSet, AlvadescData, by = "No.")
+# AlvadescWithResponse %<>% select(-c("No.", "NAME.x", "NAME.y","SMILE.y"))
+# 
+# #write.csv(AlvadescWithResponse, "C:\\MUChemistry\\DataSets\\AlvadescWithResponse.csv")
+# AlvadescWithResponse %<>% rename("SMILE" = SMILE.x)
+```
+
+Notes:
+- At this point, we need to read in the file outputted from Alvadesc. 
+- When Alvadesc creates the output file, it does not print the "SMILE" code along with the 3500 descriptors. Instead, it only prints out an identifier of "Molecule1", or "Molecule2". We handchecked the data, and verified that Alvadesc prints out the data in the same order it was put in. We did this by hand testing random compounds in Mordred, an open source equivalent to Alvadesc, and then compared the calculated Molecular Weights. Checking the first, the last, and random ones in between, the order is the same. 
+- We then created a similar unique identifier in our data set with the "good" and "bad" response code, and merged the two. 
+- The result is a data set containing all 3500 descriptors and their values from Alvadesc, along with the SMILE code, and the binary response of it being a "good" or "bad" inhibitor.
+
+### Removing Null and Zero Variance Descriptors from AlvaDesc
+```{r}
+
+#This below is very necessary to perform PCA. cant scale data with zero variance. 
+# returns vectors of column numbers with near zero variance. We will need to remove these to perform a PCA.
+
+zeroVarColumns <- nearZeroVar(AlvadescWithResponse[,-c(1:2)], names = T)
+AlvadescWithoutZeroVar <- select(AlvadescWithResponse, -zeroVarColumns)
+
+#write.csv(AlvadescWithoutZeroVar, "C:\\MUChemistry\\DataSets\\AlvadescWithoutZeroVar.csv")
+
+```
+
+Notes: 
+- Alvadesc is only able to pull 2Dimensional descriptors from the SMILE codes we inputted. All of the 3Dimensional descriptors are null, so we removed these from our data set. 
+- I believe there is a setting within Alvadesc that creates a text file with only the descriptors which it can calculate. If there are empty columns, the code above will remove those. 
+- There are a lot of columns that have zero variance, ie are all one value. These columns wont be useful in prediction, and cannot be included in a PCA analysis as they can't be scaled. 
+
+### Handling Missing Data
+```{r MissingData}
+
+introduce(AlvadescWithoutZeroVar)
+missingProfile <- profile_missing(AlvadescWithoutZeroVar)
+
+missingProfileWithOver506 <- subset(missingProfile, num_missing > 506)
+featuresWithOver506Missing <- as.vector(missingProfileWithOver506$feature)
+
+#Remove the columns with over 506 missing from the big data set
+AlvadescWithoutZeroVar %<>% select(-featuresWithOver506Missing)
+
+# create missing column indicator
+# fill.NAs from optmatch package 
+AlvadescWithoutZeroVar %<>% fill.NAs()
+
+# loop to impute columns with missing values based on mean
+for(i in 1:ncol(AlvadescWithoutZeroVar)){
+  AlvadescWithoutZeroVar[is.na(AlvadescWithoutZeroVar[,i]), i] <- mean(AlvadescWithoutZeroVar[,i], na.rm = TRUE)
+}
+
+missingProfileAfterImputation <- profile_missing(AlvadescWithoutZeroVar)
+
+## REMOVE DUPLICATE SMILES AND ROWS.
+AlvadescWithoutZeroVar %<>% distinct()
+
+#Writing the Alvadescwithoutzerovar to a cSV for RDKIT Scaffolding
+write.table(AlvadescWithoutZeroVar[,1], "C:\\MUChemistry\\DataSets\\ScaffoldImport.txt", row.names = F, col.names = F)
+
+#str(AlvadescWithoutZeroVar, list.len=ncol(AlvadescWithoutZeroVar))
+#Everything looks good, ResponseGood is a num and not a factor but thats it. 
+#All of the alvadesc columns are num, and the NA columns are logi
+```
+
+Notes:
+
+- First, we found there is a systematic grouping of missing data. In total there were 53 unique groups in the full data set. 
+- There was a natural cut-off of 506 missing rows in a column. After 506, it jumped to 1000+ missing rows and more. 
+- For columns missing more than 506 rows, we removed them from the dataset. 
+- For columns with 506 and less missing, we created indicator variables. 1 for missing and 0 for not missing. 
+- Next, we imputed the columns with 506 and less missing by taking the mean of the entire dataset. Since 506 and less observations out of 43300+ observations constitutes for less than 1% of the data, we imputed the columns. 
+- There are instances of SMILES appearing multiple times in our original data set. For rows that had conflicting responses, such as the same SMILE appearing both good and bad, we removed these earlier. However, there are instances where the same SMILE had the same response code, thus having all of the same predictors. They were identical rows. Running the distinct() function removes the duplicates. 
+
+### Scaffolding (Murcko Scaffolds) HAVE TO RUN IN JUPYTER
+```{python Scaffolding}
+import rdkit
+from rdkit.Chem.Scaffolds import MurckoScaffold
+lineList = [line.rstrip('\n') for line in open("C:\MUChemistry\DataSets\ScaffoldImport.txt")]
+
+for i in range(0,len(lineList)):
+    lineList[i] = lineList[i].strip(' \" ')
+    lineList[i] = r'{}'.format(lineList[i])
+    
+scaffoldList = [""] * len(lineList)
+mol = ""
+
+for i in range ( 0 , len(lineList)):
+    mol = rdkit.Chem.MolFromSmiles(lineList[i])
+    
+    if str(type(mol)) == "<class 'NoneType'>":
+        scaffoldList[i] = "Unable to Calculate"
+        print(i)
+        continue
+    
+    core = MurckoScaffold.GetScaffoldForMol(mol)
+    scaffold = rdkit.Chem.MolToSmiles(core)
+    if scaffold == '':
+        scaffoldList[i] = "No Rings"
+        continue
+    
+    scaffoldList[i] = scaffold
+
+results = list(zip(lineList, scaffoldList))
+
+import pandas as pd
+
+results_DF = pd.DataFrame(results, columns = ["SMILE", "ScaffoldSMILE"])
+
+results_DF.to_csv(r'C:\MUChemistry\DataSets\ScaffoldOutput.csv', index = False)
+results_DF
+
+```
+
+
+
+``` {r joiningScaffoldsToOriginal}
+ScaffoldOutput <- read.csv("C:\\MUChemistry\\DataSets\\ScaffoldOutput.csv")
+
+
+#AlvadescScaffold <- merge(x = AlvadescWithoutZeroVar, y = ScaffoldOutput, by.x = "SMILE", by.y = "SMILE") %>% distinct()
+AlvadescScaffold <- cbind(ScaffoldOutput$ScaffoldSMILE, AlvadescWithoutZeroVar)
+names(AlvadescScaffold)[names(AlvadescScaffold) == 'ScaffoldOutput$ScaffoldSMILE'] <- 'ScaffoldSMILE'
+
+AlvadescScaffold$ResponseGood %<>% as.factor()
+
+str(AlvadescScaffold, list.len=ncol(AlvadescScaffold))
+#ScaffoldSmile is a factor, SMILE is a character, response good is a factor now. Everything else looks good. 
+
+# Below is used to identify the duplicate smiles. This was done for exploratory purposes to hand check which were duplicate from the original data. This is taken care of by using distinct() from above. 
+#which(duplicated(AlvadescWithoutZeroVar$SMILE.x))
+#x <- AlvadescWithoutZeroVar[which(duplicated(AlvadescWithoutZeroVar$SMILE.x)),]
+#y <- subset(AlvadescWithoutZeroVar, SMILE.x %in% x$SMILE.x)
+
+
+```
+
+### Training & HOLDOUT WITH SCAFFOLd, what we will use moving forward
+``` {r HoldoutDataScaffolding}
+set.seed(2020)
+GroupNames <- as.data.frame(unique(AlvadescScaffold$ScaffoldSMILE)) %>% mutate(GroupNum = 1:n())
+
+colnames(GroupNames) <- c("ScaffoldSMILE","GroupNum")
+
+GroupNames$ScaffoldSMILE %<>% as.factor()
+GroupNames$GroupNum %<>% as.factor()
+
+AlvadescScaffold <- merge(x = AlvadescScaffold, y = GroupNames, by = "ScaffoldSMILE")
+
+index <- seq(1:nrow(GroupNames))
+
+groupsTrain <- sample(index, .8*length(index), replace = F)
+groupsTest <- index[-groupsTrain]
+
+TrainingSetScaffold <- subset(AlvadescScaffold, GroupNum %in% groupsTrain) %>% select(-GroupNum)
+HoldoutSetScaffold <- subset(AlvadescScaffold, GroupNum %in% groupsTest) %>% select(-GroupNum)
+
+summary(as.factor(TrainingSetScaffold$ResponseGood))
+summary(as.factor(HoldoutSetScaffold$ResponseGood))
+
+
+```
+
+Using the scaffold smiles we acquired from RDKit in python, we used the number of unique smiles as "groups" of similar compounds. In total, there was 25077(?) in our original data. Using this assumption that these were "groups", we created an index or unique identifier of each group. 
+
+From these group numbers, we split our training and holdout sets using these. We included 80% of the scaffold groups in our training set, and the remaining 20% of the groups in our holdout or out of sample daa set. 
+
+
+### Holdout WITHOUT SCAFFOLD
+``` {r HoldoutDataRandom}
+# Want to have 5,000 total observations
+# Proportions: will have 5000 * .981 = 4905 "bad", and 5000 * .019 = 95 "good"
+#good data set
+AlvadescWithoutZeroVar$ResponseGood %<>% as.factor()
+dataSetGood <- subset(AlvadescWithoutZeroVar, ResponseGood == "1")
+
+#Bad Data Set
+dataSetBad <- subset(AlvadescWithoutZeroVar, ResponseGood == "0")
+
+#Index both data sets
+holdoutGoodIndex = sample(1:nrow(dataSetGood), size = 95, replace=FALSE)
+holdoutBadIndex = sample(1:nrow(dataSetBad), size = 4905, replace = FALSE)
+
+#Creating new data sets
+holdoutGood <- dataSetGood[holdoutGoodIndex,]
+dataSetGood <- dataSetGood[-holdoutGoodIndex,]
+
+holdoutBad <- dataSetBad[holdoutBadIndex,]
+dataSetBad <- dataSetBad[-holdoutBadIndex,]
+
+HoldoutSet <- rbind(holdoutGood, holdoutBad)
+
+TrainingSet <- rbind(dataSetGood, dataSetBad)
+
+#save.image("C:\\MUChemistry\\Mitch\\Workspace\\DocumentationWorkspace.rdata")
+
+```
+Notes:
+
+- The holdout is 5000 observations. The approximate proportion of "good" to "bad" is 0.019. We will have 4905 "bad" and 95 "good". - First, we split the full dataset into two datasets. One "good" and the second "bad". Within the "good", we randomly sampled 95 records. Within the "bad", we randomly sampled 4905 records. We did this to ensure the proportion would be representative of the full dataset and randomly sampled for the holdout. 
+
+### Random Forest with Scaffold MITCH
+
+```{r readRForestScaffold1}
+
+RForestScaffold1 <- readRDS("C:\\MUChemistry\\Models\\RForestScaffold1.rds")
+
+```
+
+``` {r RForestScaffold1, eval = FALSE}
+
+# AUC Holdout = 0.8492
+
+#Parallel Processing
+cl <- makePSOCKcluster(15)
+registerDoParallel(cl)
+
+#setting up training/validation
+index<-seq(1:nrow(TrainingSetScaffold))
+
+kvalues<-c(40, 45, 50, 55, 60)
+tunegrid <- data.frame(.mtry=kvalues)
+set.seed(13)
+cvindx<-createFolds(index, k=2, returnTrain = TRUE)
+
+ctrl <- trainControl(method="cv", index=cvindx, 
+                     summaryFunction = twoClassSummary, 
+                     classProbs = TRUE)
+
+levels(TrainingSetScaffold$ResponseGood)
+levels(TrainingSetScaffold$ResponseGood) <- c("Good", "Bad")
+
+#summary(TrainingSetScaffold$ResponseGood)
+
+RForestScaffold1 <-train(x=select(TrainingSetScaffold, -ResponseGood, -SMILE,
+                                  -ScaffoldSMILE), 
+               y=TrainingSetScaffold$ResponseGood, 
+               data=TrainingSetScaffold, 
+               method="rf", 
+               tuneGrid=tunegrid, 
+               ntree=100, 
+               trControl=ctrl)
+RForestScaffold1
+# plot(RForestScaffold1)
+
+varImp(RForestScaffold1)
+saveRDS(RForestScaffold1, "C:\\MUChemistry\\Models\\RForestScaffold1.rds")
+
+stopCluster(cl)
+
+```
+
+``` {r PredictionsFromRforest}
+#AUC on Holdout
+p.RForestScaffold1Hold<-predict(RForestScaffold1, newdata = HoldoutSetScaffold, type="prob")
+r.RForestScaffold1Hold<-roc(HoldoutSetScaffold$Response,  p.RForestScaffold1Hold[,1])
+r.RForestScaffold1Hold.auc<-r.RForestScaffold1Hold$auc
+r.RForestScaffold1Hold.auc
+
+
+### Random Forest without Scaffold
+
+varimptRForest <- varImp(RForestScaffold1)
+# plot(varimptRForest)
+
+```
+
+
+### Random Forest without Scaffold AMY
+
+```{r}
+RForest1 <- readRDS("C:\\MUChemistry\\Models\\RForest1.rds")
+
+```
+
+``` {r RForestNoScaffold1, eval = FALSE}
+
+# AUC Holdout = 0.8076
+
+#Parallel Processing
+cl <- makePSOCKcluster(15)
+registerDoParallel(cl)
+
+#setting up training/validation
+index<-seq(1:nrow(TrainingSet))
+
+#Random Forest Model - can't have a variable with more than 53 categories 
+kvalues<-c(40, 45, 50, 55, 60)
+tunegrid <- data.frame(.mtry=kvalues)
+set.seed(13)
+cvindx<-createFolds(index, k=2, returnTrain = TRUE)
+
+ctrl <- trainControl(method="cv", index=cvindx, 
+                     summaryFunction = twoClassSummary, 
+                     classProbs = TRUE)
+
+# additions made to data for random forest 
+TrainingSet$ResponseGood = as.factor(TrainingSet$ResponseGood)
+# 0 is zero and 1 is one 
+levels(TrainingSet$ResponseGood) <- c("zero", "one")
+
+RForest1 <-train(x=select(TrainingSet, -ResponseGood, -SMILE), 
+               y=TrainingSet$ResponseGood, 
+               data=TrainingSet, 
+               method="rf", 
+               tuneGrid=tunegrid, 
+               ntree=100, 
+               trControl=ctrl)
+RForest1
+#plot(RForest1)
+
+
+varImp(RForest1)
+saveRDS(RForest1, "C:\\MUChemistry\\Models\\RForest1.rds")
+
+stopCluster(cl)
+
+```
+
+```{r PredictionsFromRForestReg}
+
+#AUC on Holdout
+p.RForest1Hold<-predict(RForest1, newdata = HoldoutSet, type="prob")
+r.RForest1Hold<-roc(HoldoutSet$ResponseGood,  p.RForest1Hold[,1])
+r.RForest1Hold.auc<-r.RForest1Hold$auc
+r.RForest1Hold.auc
+
+
+### Random Forest without Scaffold
+```
+
+The above two models were created as our "baseline" for comparing whether scaffolding our data was worth using to create training and holdout sets. Judging by the metric AUC, the scaffolded model performs marginally worst. This was good enough for us to move forward with Scaffolding as it is supported by previous literature. 
+
+### PCA
+```{r PCANormal}
+
+preProcessTrainScaffold <- preProcess(TrainingSetScaffold, method = c("center","scale"))
+
+ind <- sapply(TrainingSetScaffold, is.numeric)
+#ScaledTrainingSetScaffold <- lapply(ScaledTrainingSetScaffold[ind], scale)
+#View(ScaledTrainingSetScaffold[ind])
+
+trainingScaffoldPCA <-prcomp(predict(preProcessTrainScaffold, TrainingSetScaffold)[ind], 
+                             scale = F, center = F)
+
+#weights 
+#trainingScaffoldPCA$rotation
+
+#summary(trainingScaffoldPCA)
+View(summary(trainingScaffoldPCA)[["importance"]])
+
+```
+
+PCA - 99.99
+
+Notes: 
+- First step we want to do before running our PCA analysis is mean centering the data and to normalize it as well. We will mean center it, and standardize it using the z-score method. 
+- Correction to above: we have decided not to scale the entire data set before running the PCA. Instead, we will let PCA scale it for us. Our rational: doing it this way, we can preserve the original data, and avoid mistakenly double or triple scaling the data if a certain model/technique scale it automatically without our knowledge. 
+
+Notes: 
+- The first step in running the PCA on our training set was to first create a preprocessing object that would mean center and scale the data. We could then use the values from this to project on to any new data, ensuring we are applying the exact same weights and scaling numbers to any new data set. 
+
+- PCA can only be done on numerical columns. We created an index of the numerical columns in our data set, called "ind". This index will be used for our validation set, our holdout set, and any future data. We are operating under the assumption that any new compounds can be run through alvadesc and will have the exact same columns/predictors. 
+
+- Within the prcomp, we used the predict function to project the center and scaling data we calculated from the TrainingSetScaffold data set on to itself. In effect, this simply just mean centers and then scales it based on each columns standard deviation. From this data set, I indexed for just numeric columns using the "ind" index created above. To prevent our data from being scaled or centered twice, I set these functions within PRComp to false. 
+
+``` {r ProjectingPCATrainingWeights}
+
+#Step 1: save the weights from the PCA analysis
+pcaTrainingScaffoldWeights <- trainingScaffoldPCA$rotation
+
+#Step two: matrix multiplication of the PCA components. This is currently using all weights.
+#Subset it doing something like: t(pcaTrainingWeights[,1:400]) for the first 400 components
+TrainingSetScaffoldPCA <- as.matrix(predict(preProcessTrainScaffold,TrainingSetScaffold)[ind]) %*% (pcaTrainingScaffoldWeights[,seq(1:400)])
+
+#Converting the large matrix to a dataframe
+TrainingSetScaffoldPCA %<>% as.data.frame()
+
+#The above data frame is the numeric columns transformed by the PCA weights. 
+#Binding the non-numeric columns, including the SMILES, the response, and missing value indicator columns to this data set. 
+TrainingSetScaffoldPCA <- cbind(TrainingSetScaffold[!ind],TrainingSetScaffoldPCA)
+
+str(TrainingSetScaffoldPCA, list.len=ncol(TrainingSetScaffoldPCA))
+
+### This below is for exporting the data to run SMOTENC on it in jupyter. 
+TrainingSetScaffoldPCAList <- TrainingSetScaffoldPCA %>% as.list()
+
+write.table(as.data.frame(TrainingSetScaffoldPCAList),file="C:\\MUChemistry\\DataSets\\TrainingSetScaffoldPCA.csv", quote=F,sep=",",row.names=F)
+
+
+```
+
+
+
+``` {r ProjectingPCAHoldout}
+
+#Step two: matrix multiplication of the PCA components. This is currently using all weights.
+#Subset it doing something like: t(pcaTrainingWeights[,1:400]) for the first 400 components
+HoldoutScaffoldPCA <- as.matrix(predict(preProcessTrainScaffold,HoldoutSetScaffold)[ind]) %*% (pcaTrainingScaffoldWeights[,1:400])
+
+#Converting the large matrix to a dataframe
+HoldoutScaffoldPCA %<>% as.data.frame()
+
+#The above data frame is the numeric columns transformed by the PCA weights. 
+#Binding the non-numeric columns, including the SMILES, the response, and missing value indicator columns to this data set. 
+HoldoutScaffoldPCA <- cbind(HoldoutSetScaffold[!ind],HoldoutScaffoldPCA)
+
+write.csv(HoldoutScaffoldPCA, "C:\\MUChemistry\\DataSets\\HoldoutSets\\HoldoutScaffoldPCA.csv")
+
+```
+Notes: 
+- Within the matrix multiplication, use the preProcessTrain function to center and scale the holdout set based on the values from our training set, and then only pulling the numerical columns from it. 
+
+Now that we have our PCA weights above, we created new Training and holdout sets transformed by the first 400 PCA components. We decided to start with 400 components because this was the lowest number of components we could go and still keep 99% of the total variation. We had hoped we could reduce the dimension further, but we will move forward with the 400 components. 
+
+
+### Random Forest on PCA
+```{r}
+RForestScaffoldPCA1 <- readRDS("C:\\MUChemistry\\Models\\RForestScaffoldPCA1.rds")
+```
+
+``` {r RForestPCA, eval = FALSE}
+
+# AUC HoldoutScaffoldPCA = 0.8059
+
+#Parallel Processing
+set.seed(2020)
+cl <- makePSOCKcluster(25)
+registerDoParallel(cl)
+
+kvalues<-c(40, 45, 50, 55, 60)
+tunegrid <- data.frame(.mtry=kvalues)
+cvindx<-createFolds(index, k=2, returnTrain = TRUE)
+
+ctrl <- trainControl(method="cv", index=cvindx, 
+                     summaryFunction = twoClassSummary, 
+                     classProbs = TRUE)
+
+levels(TrainingSetScaffoldPCA$ResponseGood)
+levels(TrainingSetScaffoldPCA$ResponseGood) <- c("Good", "Bad")
+
+
+RForestScaffoldPCA1 <-train(x=select(TrainingSetScaffoldPCA, -ResponseGood, -SMILE, -ScaffoldSMILE), 
+               y=TrainingSetScaffoldPCA$ResponseGood, 
+               data=TrainingSetScaffoldPCA, 
+               method="rf", 
+               tuneGrid=tunegrid, 
+               ntree=100, 
+               trControl=ctrl)
+RForestScaffoldPCA1
+
+varImp(RForestScaffoldPCA1)
+saveRDS(RForestScaffoldPCA1, "C:\\MUChemistry\\Models\\RForestScaffoldPCA1.rds")
+x <- RForestScaffoldPCA1$trainingData
+
+stopCluster(cl)
+
+```
+
+``` {r PredFromPCARForest}
+#AUC on Holdout
+p.RForestScaffoldPCA1Hold<-predict(RForestScaffoldPCA1, data = HoldoutScaffoldPCA , type="prob")
+r.RForestScaffoldPCA1Hold<-roc(HoldoutScaffoldPCA$Response,  p.RForestScaffoldPCA1Hold[,1])
+r.RForestScaffoldPCA1Hold.auc<-r.RForestScaffoldPCA1Hold$auc
+
+r.RForestScaffoldPCA1Hold.auc
+
+varImp(RForestScaffoldPCA1)
+
+```
+
+### SMOTE NC in Python
+``` {python}
+
+import pandas as pd
+import numpy as np
+from imblearn.over_sampling import SMOTENC, ADASYN
+
+#Load the file into a pandas data frame.
+data = pd.read_csv("C:\MUChemistry\DataSets\TrainingSetScaffoldPCA.csv")
+
+
+#Get structural information of the data set.
+data
+
+cnames=list(data.select_dtypes(exclude=['object']).columns)
+
+
+data.iloc[:,376] #this is the last categorical column
+
+data.iloc[:,380:390]
+
+X_train = data.iloc[:,3:]
+
+y_train = data.iloc[:,2]
+
+X_train.iloc[:,373] #Last categorical variable in X_train
+
+dup_size = 3
+
+smote_nc = SMOTENC(categorical_features=list(np.arange(0,374)), 
+                   sampling_strategy = (
+                       (np.unique(y_train, return_counts=True)[1][1]) * dup_size / 
+                       (np.unique(y_train, return_counts=True)[1][0])),random_state=2020)
+
+
+X_smoted, y_smoted = smote_nc.fit_resample(X_train, y_train)
+
+yvals, counts = np.unique(y_train, return_counts=True)
+yvals_smt, counts_smt = np.unique(y_smoted, return_counts=True)
+
+print('Classes in test set:',dict(zip(yvals, counts)),'\n',
+      'Classes in rebalanced test set with SMOTENC:',dict(zip(yvals_smt, counts_smt)))
+
+SmoteDataFrame = X_smoted.copy(deep = True)
+
+
+SmoteDataFrame['Response'] = y_smoted
+SmoteDataFrame
+
+#Save the new data frame to CSV
+SmoteDataFrame.to_csv(r'C:\MUChemistry\DataSets\SmoteDataFrame.csv', index = False)
+
+```
+
+Due to severe class imbalance, we used SMOTE NC in python to synthetically over sample the data. We attempted SMOTE in r, but the algorithm is unable to handle categorical predictors. 
+
+``` {r readingSmoteData}
+TrainingSetSmoteNC <- read.csv("C:\\MUChemistry\\DataSets\\SmoteDataFrame.csv")
+
+#str(TrainingSetSmoteNC, list.len=ncol(TrainingSetSmoteNC))
+#All NA columns are factors now. All alvadesc columns are num, and response is an int
+TrainingSetSmoteNC$Response %<>% as.factor()
+
+
+```
+
+
+``` {r oldSample}
+
+# creating the 20 samples 
+
+GoodSmote <- subset(TrainingSetSmoteNC, Response == 1)
+BadSmote <- subset(TrainingSetSmoteNC, Response == 0)
+BadSmoteIndex <- seq(1:nrow(BadSmote))
+index <- BadSmoteIndex
+floor(nrow(BadSmote) / nrow(GoodSmote))
+
+vec <- list()
+dataFrameList <- list()
+
+for (val in seq(1:floor(nrow(BadSmote) / nrow(GoodSmote)))) {
+  tempSample <- sample(index, size = 1728, replace = FALSE)
+  index <- index[-tempSample]
+  tempDataFrame <- BadSmote[tempSample,]
+  goodDataFrame <- GoodSmote
+  
+  tempDataFrame2 <- rbind(tempDataFrame,goodDataFrame)
+  dataFrameList[[val]] <- tempDataFrame2
+  vec[[val]] <- tempSample
+  
+} 
+
+#str(dataFrameList[[1]], list.len=ncol(dataFrameList[[1]]))
+
+```
+
+For model building, we wanted to have a 50/50 split of good and bad data. However, even with SMOTE'd data, we only had 1642 total good observations, and about 36000 bad data. Our solution to this is to split our 36000 bad data in to 20 different groups of 1642 observations, and join the 1642 good observations to them. Next, we will build a model on each, and ensemble all of them together.
+
+At this point, we have all of the data sets we will need moving forward for any model (we think). We have: 
+1. A standard training and holdout set created directly from Alvadesc Output created using random sampling with an 80/20 split
+2. A training and holdout set created from the Alvadesc Output created using an 80/20 split of the Murcko Scaffold groups. There were about 25,000 groups in total. 80% of those groups would be training, and any compound that belonged to one of those groups would be a training observation. 
+3. A training and holdout set with PCA projected on to the Murcko Scaffolded training set. We elected to keep 400 components, as that allowed us to keep 99% of the original variation. 
+4. A SMOTED training set, done on the PCA training set. The out of sample holdout set we will use is the original PCA Holdout set created in the step above. 
+5. A set of 20 different samples from the SMOTED training set. We took all of the good observations, about 1600, and combined that with a random sample of 1600 bad sampled without replacement. 
+
+Below, we are simply writing all of these to 
+
+``` {r, eval = FALSE}
+#Step 1 
+write.csv(TrainingSet, "C:\\MUChemistry\\DataSets\\TrainingSets\\TrainingSet.csv")
+write.csv(TrainingSet, "C:\\MUChemistry\\DataSets\\HoldoutSets\\HoldoutSet.csv")
+
+#Step 2
+write.csv(TrainingSetScaffold, "C:\\MUChemistry\\DataSets\\TrainingSets\\TrainingSetScaffold.csv")
+write.csv(TrainingSetScaffold, "C:\\MUChemistry\\DataSets\\HoldoutSets\\HoldoutSetScaffold.csv")
+
+#Step 3
+write.csv(TrainingSetScaffoldPCA,
+          "C:\\MUChemistry\\DataSets\\TrainingSets\\TrainingSetScaffoldPCA.csv")
+write.csv(TrainingSetScaffoldPCA,
+          "C:\\MUChemistry\\DataSets\\HoldoutSets\\HoldoutScaffoldPCA.csv")
+
+#Step 4
+write.csv(TrainingSetSmoteNC, "C:\\MUChemistry\\DataSets\\TrainingSets\\TrainingSetSmoteNC.csv")
+
+#Step 5
+for(i in seq(1:length(dataFrameList))){
+  write.csv(dataFrameList[[i]],
+            paste("C:\\MUChemistry\\DataSets\\TrainingSets\\20SamplesOfTrainingSetSmoteNC\\", "Sample", i, ".csv",sep = ""))
+  
+}
+
+```
+
+
+``` {r BuildingXGBTrees, eval = FALSE}
+######################## creating all 20 models #################
+fitControl = trainControl(
+  method = "cv", # k-fold cross validation
+  number = 10, # Number of Folds
+  search = "grid", # grid search for parameter tuning when applicable
+  summaryFunction = twoClassSummary, # see custom_functions
+  classProbs = T, # should class probabilities be returned
+  selectionFunction = "best", # best fold
+  savePredictions = 'all', 
+  allowParallel = T)
+
+
+
+grid <- expand.grid(.nrounds = c(200, 400,600), 
+                    .max_depth = c(6, 10, 15), 
+                    .eta = c(0.01, 0.1),
+                    .gamma = c(0,3,5,10), 
+                    .colsample_bytree = c(.5, .75, 1),
+                    .min_child_weight = 1,
+                    .subsample = 1
+)
+
+
+
+modelList <- list()
+timeList <- list()
+
+cl <- makePSOCKcluster(25)
+registerDoParallel(cl)
+
+for(i in seq(1:length(dataFrameList))){
+  startTime <- Sys.time()
+  trainSample <- dataFrameList[[i]]
+  trainSample$Response <- recode_factor(trainSample$Response, `0` = "Bad", `1` = "Good")
+  
+  
+  tempModel <- train(Response ~ ., data = trainSample, 
+                     family = "binomial",
+                     metric = "ROC", 
+                     method = "xgbTree", 
+                     tuneGrid = grid, 
+                     trControl = fitControl)
+  
+  modelList[[i]] <- tempModel
+  saveRDS(tempModel, paste("C:\\MUChemistry\\Models\\ModelsOn20Samples\\", 
+                           "ModelSample", i, ".rds", sep = ""))
+  
+  endTime <- Sys.time()
+  timeList[[i]] <- endTime - startTime
+  
+}
+
+stopCluster(cl)
+saveRDS(modelList, "C:\\MUChemistry\\Models\\ModelList.rds")
+
+```
+
+``` {r PredictionsFrom20Models}
+
+predList <- list()
+
+predData <- HoldoutScaffoldPCA[,-c(1:3)]
+predData$Response <- HoldoutScaffoldPCA$ResponseGood
+cols <- sapply(predData, is.logical)
+predData[,cols] <- lapply(predData[,cols], function(x){as.factor(x)})
+predData[,cols] <- sapply(predData[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" = "False")})
+
+predData <-model.matrix(object = Response~., data = predData)
+predData <- predData[,-1]
+predDataDMatrix <- xgboost::xgb.DMatrix(predData, missing = NA)
+
+
+for (i in seq(1:length(modelList))){
+  tempPred<-predict(modelList[[i]]$finalModel, newdata = predDataDMatrix)
+  predList[[i]] <- tempPred
+}
+
+averagePredList <- list()
+
+for(i in seq(1:nrow(HoldoutScaffoldPCA))){
+  runningTotal <- 0
+  
+  for(k in seq(1:length(predList))){
+    runningTotal <- runningTotal + predList[[k]][i]
+  }
+  averagePred <- runningTotal / length(predList)
+  averagePredList[[i]] <- averagePred
+  
+}
+
+r.BoostedPred<-roc(HoldoutScaffoldPCA$Response,  as.numeric(averagePredList))
+r.BoostedPred.AUC<-r.BoostedPred$auc
+r.BoostedPred.AUC
+
+
+```
+
+``` {r ReadIn20Models}
+ModelListTuningParam <- list.files(path = "C:\\MUChemistry\\Models\\ModelsOn20SamplesTuningParam", 
+                                   pattern = ".rds", full.names = T) %>% map(read_rds)
+
+```
+
+``` {r Building612Models}
+grid <- read.csv("C:\\MUChemistry\\Models\\xgboostGrid.csv")
+
+paramList = list()
+j = 1
+k = 1
+
+maxModels <- nrow(grid) * length(TrainingSetScaffoldPCASmoteList)
+
+for (i in seq(1:maxModels)){
+    paramList[[i]] = list()
+    paramList[[i]][[1]] = paste("Sample", k, sep = "")
+    paramList[[i]][[2]] = paste("Model", j, sep = "")
+    paramList[[i]][[3]] = grid[j,1]
+    paramList[[i]][[4]] = grid[j,2]
+    paramList[[i]][[5]] = grid[j,3]
+    paramList[[i]][[6]] = grid[j,4]
+    paramList[[i]][[7]] = grid[j,5]
+    paramList[[i]][[8]] = grid[j,6]
+    paramList[[i]][[9]] = grid[j,7]
+    j = j + 1
+
+    if (j == nrow(grid) +1){
+      j = 1
+      k = k + 1
+    }
+    if (k == length(TrainingSetScaffoldPCASmoteList) + 1){
+      k = 1
+    }
+      
+}
+
+xgbGrid <- data.frame(do.call(rbind, paramList))
+colnames(xgbGrid) <- c("SampleNum", "ModelNum", ".nrounds", ".max_depth",  ".eta", ".gamma", 
+                 ".colsample_bytree", ".min_child_weight", ".subsample")
+
+xgbGrid[c(1:2)] <- sapply(xgbGrid[c(1:2)],as.character)
+xgbGrid[c(3:9)] <- sapply(xgbGrid[c(3:9)],as.numeric)
+
+
+cl <- makePSOCKcluster(35)
+registerDoParallel(cl)
+
+fitControl = trainControl(
+  method = "cv", # k-fold cross validation
+  number = 10, # Number of Folds
+  search = "grid", # grid search for parameter tuning when applicable
+  summaryFunction = twoClassSummary, # see custom_functions
+  classProbs = T, # should class probabilities be returned
+  selectionFunction = "best", # best fold
+  savePredictions = 'all', 
+  allowParallel = T)
+
+trainSampleTracker = 1
+giantModelList <- list()
+
+
+for (i in seq(1:nrow(xgbGrid))){
+  
+  trainSample <- TrainingSetScaffoldPCASmoteList[[trainSampleTracker]]
+  trainSample$Response %<>% as.factor()
+  trainSample$Response <- relevel(trainSample$Response, ref = "Good")
+
+  
+  tempModel <- train(Response ~ ., data = trainSample, 
+                     family = "binomial",
+                     metric = "ROC", 
+                     method = "xgbTree", 
+                     tuneGrid = xgbGrid[i,c(3:9)], 
+                     trControl = fitControl)
+  
+  giantModelList[[i]] <- tempModel
+  saveRDS(tempModel, paste("C:\\MUChemistry\\Models\\612Models\\", 
+                           "ModelNum", i, ".rds", sep = ""))
+  if(i %% 34 == 0){
+    trainSampleTracker = trainSampleTracker + 1
+  }
+  
+}
+
+stopCluster(cl)
+
+
+```
+
+
+``` {r PredictionsFrom680Models}
+predListHoldout <- list()
+
+predDataHoldout <- HoldoutScaffoldPCA[,-c(1:3)]
+predDataHoldout$Response <- HoldoutScaffoldPCA$ResponseGood
+cols <- sapply(predDataHoldout, is.logical)
+predDataHoldout[,cols] <- lapply(predDataHoldout[,cols], function(x){as.factor(x)})
+predDataHoldout[,cols] <- sapply(predDataHoldout[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" = "False")})
+
+predDataHoldout <-model.matrix(object = Response~., data = predDataHoldout)
+predDataHoldout <- predDataHoldout[,-1]
+predDataHoldoutDMatrix <- xgboost::xgb.DMatrix(predDataHoldout, missing = NA)
+
+
+for (i in seq(1:length(giantModelList))){
+  tempPred<-predict(giantModelList[[i]]$finalModel, newdata = predDataHoldoutDMatrix)
+  predListHoldout[[i]] <- tempPred
+}
+
+aucPredListHoldout <- list()
+
+for(i in seq(1:length(predListHoldout))){
+  tempROC = roc(HoldoutScaffoldPCA$ResponseGood, predListHoldout[[i]])
+  tempAUC = auc(tempROC)
+  aucPredListHoldout[[i]] = tempAUC
+}
+
+aucDFHold <- data.frame(do.call(rbind, aucPredListHoldout))
+
+
+```
+
+``` {r PredictionsFrom680Models}
+predListTrain <- list()
+
+predDataTrain <- TrainingSetScaffoldPCA[,-c(1:3)]
+predDataTrain$Response <- TrainingSetScaffoldPCA$ResponseGood
+cols <- sapply(predDataTrain, is.logical)
+predDataTrain[,cols] <- lapply(predDataTrain[,cols], function(x){as.factor(x)})
+predDataTrain[,cols] <- sapply(predDataTrain[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" = "False")})
+
+predDataTrain <-model.matrix(object = Response~., data = predDataTrain)
+predDataTrain <- predDataTrain[,-1]
+predDataTrainDMatrix <- xgboost::xgb.DMatrix(predDataTrain, missing = NA)
+
+
+trainSampleTracker = 1
+
+for (i in seq(1:length(giantModelList))){
+  predDataTrain <- dataFrameList[[trainSampleTracker]]
+  cols <- sapply(predDataTrain, is.logical)
+  predDataTrain[,cols] <- lapply(predDataTrain[,cols], function(x){as.factor(x)})
+  predDataTrain[,cols] <- sapply(predDataTrain[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" =
+                                                                            "False")})
+  predDataTrain <-model.matrix(object = Response~., data = predDataTrain)
+  predDataTrain <- predDataTrain[,-1]
+  predDataTrainDMatrix <- xgboost::xgb.DMatrix(predDataTrain, missing = NA)
+  
+  tempPred<-predict(giantModelList[[i]]$finalModel, newdata = predDataTrainDMatrix)
+  predListTrain[[i]] <- tempPred
+  
+  
+  if(i %% 34 == 0){
+    trainSampleTracker = trainSampleTracker + 1
+  }
+
+}
+
+aucPredListTrain <- list()
+
+trainSampleTracker = 1
+
+for(i in seq(1:length(predListTrain))){
+  tempROC = roc(dataFrameList[[trainSampleTracker]]$Response, predListTrain[[i]])
+  tempAUC = auc(tempROC)
+  aucPredListTrain[[i]] = tempAUC
+  
+  if(i %% 34 == 0){
+    trainSampleTracker = trainSampleTracker + 1
+  }
+}
+
+aucDFTrain <- data.frame(do.call(rbind, aucPredListTrain))
+
+xgbGrid <- cbind(xgbGrid, aucDFTrain, aucDFHold)
+
+colnames(xgbGrid) <- c("SampleNum", "ModelNum", ".nrounds", ".max_depth",  ".eta", ".gamma", 
+                 ".colsample_bytree", ".min_child_weight", ".subsample", "AucTrain", "AucHoldout")
+
+write.csv(xgbGrid, "C:\\MUChemistry\\Models\\TuningParamAucGrid.csv", row.names = F)
+
+```
+
+``` {r ReRunningXgbTreeAfterTuning}
+
+######################## creating all 20 models #################
+fitControl = trainControl(
+  method = "cv", # k-fold cross validation
+  number = 10, # Number of Folds
+  search = "grid", # grid search for parameter tuning when applicable
+  summaryFunction = twoClassSummary, # see custom_functions
+  classProbs = T, # should class probabilities be returned
+  selectionFunction = "best", # best fold
+  savePredictions = 'all', 
+  allowParallel = T)
+
+
+
+tunedXgbGrid <- expand.grid(.nrounds = 400, 
+                    .max_depth = 4, 
+                    .eta = c(0.001, 0.01),
+                    .gamma = 50, 
+                    .colsample_bytree = 1,
+                    .min_child_weight = 1,
+                    .subsample = .8
+)
+
+
+tunedModelList <- list()
+
+cl <- makePSOCKcluster(35)
+registerDoParallel(cl)
+
+for(i in seq(1:1)){
+  trainSample <- test[,-1]
+  trainSample$Response <- recode_factor(trainSample$Response, `0` = "Bad", `1` = "Good")
+  trainSample$Response <- relevel(trainSample$Response, ref = "Good")
+
+  
+  
+  tempModel <- train(Response ~ ., data = trainSample, 
+                     family = "binomial",
+                     metric = "ROC", 
+                     method = "xgbTree", 
+                     tuneGrid = tunedXgbGrid, 
+                     trControl = fitControl)
+  
+  tunedModelList[[i]] <- tempModel
+  #saveRDS(tempModel, paste("C:\\MUChemistry\\Models\\TunedModelsOn20Samples\\", 
+  #                         "ModelSample", i, ".rds", sep = ""))
+  
+}
+
+stopCluster(cl)
+saveRDS(tunedModelList, "C:\\MUChemistry\\Models\\TunedModelList.rds")
+
+```
+
+``` {r PredictionsFromTuned20Models}
+predListHoldoutTuned <- list()
+
+predDataHoldout <- HoldoutScaffoldPCA[,-c(1:3)]
+predDataHoldout$Response <- HoldoutScaffoldPCA$ResponseGood
+cols <- sapply(predDataHoldout, is.logical)
+predDataHoldout[,cols] <- lapply(predDataHoldout[,cols], function(x){as.factor(x)})
+predDataHoldout[,cols] <- sapply(predDataHoldout[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" = "False")})
+
+predDataHoldout <-model.matrix(object = Response~., data = predDataHoldout)
+predDataHoldout <- predDataHoldout[,-1]
+predDataHoldoutDMatrix <- xgboost::xgb.DMatrix(predDataHoldout, missing = NA)
+
+
+for (i in seq(1:length(TunedModelList))){
+  tempPred<-predict(TunedModelList[[i]]$finalModel, newdata = predDataHoldoutDMatrix)
+  predListHoldoutTuned[[i]] <- tempPred
+}
+
+aucPredListHoldoutTuned <- list()
+
+for(i in seq(1:length(predListHoldoutTuned))){
+  tempROC = roc(HoldoutScaffoldPCA$ResponseGood, predListHoldoutTuned[[i]])
+  tempAUC = auc(tempROC)
+  aucPredListHoldoutTuned[[i]] = tempAUC
+}
+
+aucDFHoldTuned <- data.frame(do.call(rbind, aucPredListHoldoutTuned))
+
+
+
+########
+
+predListTrainTuned <- list()
+
+predDataTrain <- TrainingSetScaffoldPCA[,-c(1:3)]
+predDataTrain$Response <- TrainingSetScaffoldPCA$ResponseGood
+cols <- sapply(predDataTrain, is.logical)
+predDataTrain[,cols] <- lapply(predDataTrain[,cols], function(x){as.factor(x)})
+predDataTrain[,cols] <- sapply(predDataTrain[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" = "False")})
+
+predDataTrain <-model.matrix(object = Response~., data = predDataTrain)
+predDataTrain <- predDataTrain[,-1]
+predDataTrainDMatrix <- xgboost::xgb.DMatrix(predDataTrain, missing = NA)
+
+
+for (i in seq(1:length(dataFrameList))){
+  predDataTrain <- dataFrameList[[i]]
+  cols <- sapply(predDataTrain, is.logical)
+  predDataTrain[,cols] <- lapply(predDataTrain[,cols], function(x){as.factor(x)})
+  predDataTrain[,cols] <- sapply(predDataTrain[,cols],function(x){ recode(x,"TRUE" = "True", "FALSE" =
+                                                                            "False")})
+  predDataTrain <-model.matrix(object = Response~., data = predDataTrain)
+  predDataTrain <- predDataTrain[,-1]
+  predDataTrainDMatrix <- xgboost::xgb.DMatrix(predDataTrain, missing = NA)
+  
+  tempPred<-predict(tunedModelList[[i]]$finalModel, newdata = predDataTrainDMatrix)
+  predListTrainTuned[[i]] <- tempPred
+
+}
+
+aucPredListTrainTuned <- list()
+
+for(i in seq(1:length(predListTrainTuned))){
+  tempROC = roc(dataFrameList[[i]]$Response, predListTrainTuned[[i]])
+  tempAUC = auc(tempROC)
+  aucPredListTrainTuned[[i]] = tempAUC
+}
+
+aucDFTrainTuned <- data.frame(do.call(rbind, aucPredListTrainTuned))
+
+
+averagePredListTuned <- list()
+
+for(i in seq(1:nrow(HoldoutScaffoldPCA))){
+  runningTotal <- 0
+  
+  for(k in seq(1:length(predListHoldoutTuned))){
+    runningTotal <- runningTotal + predListHoldoutTuned[[k]][i]
+  }
+  averagePred <- runningTotal / length(predList)
+  averagePredList[[i]] <- averagePred
+  
+}
+
+r.BoostedPred<-roc(HoldoutScaffoldPCA$Response,  as.numeric(averagePredList))
+r.BoostedPred.AUC<-r.BoostedPred$auc
+r.BoostedPred.AUC
+
+
+```
+
+## Fitting models on raw data and without sampling for comparison 
+
+``` {r xgbTree Alvadesc Without zero var without Samples}
+
+######################## creating all 20 models #################
+fitControl = trainControl(
+  method = "cv", # k-fold cross validation
+  number = 10, # Number of Folds
+  search = "grid", # grid search for parameter tuning when applicable
+  sampling = "down",
+  summaryFunction = twoClassSummary, # see custom_functions
+  classProbs = T, # should class probabilities be returned
+  selectionFunction = "best", # best fold
+  savePredictions = 'all', 
+  allowParallel = T)
+
+
+
+xgbGrid <- expand.grid(.nrounds = 400, 
+                    .max_depth = 20, 
+                    .eta = .01,
+                    .gamma = 47, 
+                    .colsample_bytree = .2,
+                    .min_child_weight = 1,
+                    .subsample = 0.8
+)
+
+
+
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+trainSample <- TrainingSetScaffold
+trainSample$Response %<>% as.factor()
+trainSample$Response <- relevel(trainSample$Response, ref = "Good")
+
+model <- train(Response ~ ., data = select(trainSample, -SMILE), 
+                     family = "binomial",
+                     metric = "ROC", 
+                     method = "xgbTree", 
+                     tuneGrid = xgbGrid, 
+                     trControl = fitControl)
+  
+stopCluster(cl)
+
+```
+
+``` {r xgbTree Alvadesc Without zero var without Samples}
+
+######################## creating all 20 models #################
+fitControl = trainControl(
+  method = "cv", # k-fold cross validation
+  number = 10, # Number of Folds
+  search = "grid", # grid search for parameter tuning when applicable
+  sampling = "down",
+  summaryFunction = twoClassSummary, # see custom_functions
+  classProbs = T, # should class probabilities be returned
+  selectionFunction = "best", # best fold
+  savePredictions = 'all', 
+  allowParallel = T)
+
+
+
+xgbGrid <- expand.grid(.nrounds = 400, 
+                    .max_depth = 20, 
+                    .eta = .01,
+                    .gamma = 47, 
+                    .colsample_bytree = .2,
+                    .min_child_weight = 1,
+                    .subsample = 0.8
+)
+
+
+
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+trainSample <- TrainingSet
+trainSample$Response %<>% as.factor()
+trainSample$Response <- relevel(trainSample$Response, ref = "Good")
+
+model <- train(Response ~ ., data = select(trainSample, -SMILE), 
+                     family = "binomial",
+                     metric = "ROC", 
+                     method = "xgbTree", 
+                     tuneGrid = xgbGrid, 
+                     trControl = fitControl)
+  
+stopCluster(cl)
+
+```
+
+``` {r}
+
+HoldoutSet <- vroom("C:\\MUChemistry\\DataSets\\HoldoutSets\\HoldoutSet.csv")
+HoldoutSetMatrix <- xgbTreeDataPrep(HoldoutSet, model)
+
+pred <- predict(model$finalModel, newdata = HoldoutSetMatrix)
+
+ROC = roc(HoldoutSet$Response, pred)
+AUC = auc(ROC)
+AUC
+
+```
+
+``` {r xgbTree on raw data}
+
+```
+
+
+

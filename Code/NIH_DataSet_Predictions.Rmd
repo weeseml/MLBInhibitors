@@ -1,0 +1,199 @@
+---
+title: "MuChemistry"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read in necessary files
+
+Will need to read in: 
+1. Model(s) to predict from 
+2. Alvadesc data that has been cleaned to matchup missing value indicator columns and columns removed previously prior to model training
+3. Preprocess object used to process the model's training data
+4. PCA object used to process the model's training data
+5. Functions used to transform data
+
+``` {r readInFiles}
+
+#Step 1: read in models 
+#tunedModelList = readRDS("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Models_Clean\\tunedModelList.rds")
+
+tunedModelList = readRDS("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Models_Everything\\tunedModelList.rds")
+
+
+#Step 2: Read in alvadesc data that has been cleaned (remove bad/zero var columns)
+AlvadescWithoutZeroVar = read.csv( "C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Models_Clean\\Files_For_Predictions\\AlvadescWithoutZeroVar.csv")
+
+#Step 3
+preProcessTrainScaffold = readRDS("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Models_Clean\\Files_For_Predictions\\preProcessTrainScaffold.rds")
+
+# step 4
+
+trainingScaffoldPCA = readRDS("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Models_Clean\\Files_For_Predictions\\trainingScaffoldPCA.rds")
+
+# Added 4/28
+trainingSetScaffold = readRDS("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Created_DataSets\\Training_Data\\TrainingSetScaffold.csv")
+
+# Step 5
+source("C:\\MUChemistry\\Functions\\RemoveMissing.r")
+source("C:\\MUChemistry\\Functions\\ImputeMissing.r")
+source("C:\\MUChemistry\\Functions\\projectPCA.r")
+source("C:\\MUChemistry\\Functions\\removeBadCompounds.r")
+
+
+```
+
+### Reading in NIH Data
+
+``` {r 3}
+NIH70kData <- vroom("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Predictions_New_Data\\SecondNIHLibrary.txt", delim = "\t", na = c("NA","Na", "na", ""))
+NIH70kData.smiles <- vroom("C:\\MUChemistry\\Initial_Analysis_Compounds_From_Literature\\Predictions_New_Data\\SecondNIHLibrarySMILES.txt", col_names = F, delim = "\t", na = c("NA","Na", "na", ""))
+colnames(NIH70kData.smiles) <- c("SMILE")
+NIH70kData <- cbind(NIH70kData.smiles, NIH70kData)
+``` 
+
+### Cleaning the NIH data
+
+``` {r 4}
+NIH70kData %<>% 
+  select_if(names(.) %in% c(colnames(AlvadescWithoutZeroVar))) # Removing any columns that were removed due to them being zero variance in the original data set
+
+  # In our original training set, before SMOTE or PCA, we removed columns that had near zero variance using the zeroVar function (see large documentation rmd). To ensure the same columns are removed/kept in the new data, instead of rerunning that same function, we just selected the columns from NIH70kData that are also in AlvadescwithoutZeroVar. 
+
+NIH70kData <- missingValues(dataSet = NIH70kData) # Imputing values for missing observations and creating missing value indicator columns
+
+
+#Using the TrainingSet, which is the original raw data that was partitioned by random sample, I need to check to see if there were any missing value indicator columns in the original data that was not just created by the missingValues function. Below is accomplishing that. 
+
+TrainSetCols <- as.vector(colnames(TrainingSetScaffold))
+NewDataCols <- as.vector(colnames(NIH70kData))
+`%notin%` <- Negate(`%in%`)
+
+
+for (i in TrainSetCols) {
+  if (i %in% NewDataCols){
+    next
+  }
+  else if (i == "Response"){
+    next
+  }
+  else if (i %notin% NewDataCols){
+    tempList <- rep(0, nrow(NIH70kData)) #Calling everything in our new data as False or not missing
+    NIH70kData <- cbind(NIH70kData, tempList)
+    NIH70kData$tempList %<>% as.factor()
+    levels(NIH70kData$tempList) <- c(0,1)
+    colnames(NIH70kData)[colnames(NIH70kData) == 'tempList'] <- i
+  }
+  
+}
+
+#NIH70kData %<>% distinct() #Just to ensure there are no duplicates. There were 76369 observations before, and 76168 after. Indicates there were some duplicate SMILES in the original data. This isn't concerning, but just needs to be removed. 
+
+NIH70kData %<>% 
+  select_if(names(.) %in% c(colnames(AlvadescWithoutZeroVar)))
+  # running the same code as above to ensure there aren't any missing value indicator columns created in fill.nas that aren't in our original data that the model was built on. If there are, they are removed. 
+
+```
+
+### Projecting PCA Weights calculated from Training Set
+
+``` {r 5}
+
+ind <- sapply(NIH70kData, is.numeric) #index of numeric columns 
+
+#Step two: matrix multiplication of the PCA components. This is currently using all weights.
+#Projecting PCA Training weights on to it
+
+NIH70kDataPCA <- projectPCA(dataSet = NIH70kData, pcaObject = trainingScaffoldPCA, numComponents = 400, preProcessItem = preProcessTrainScaffold)
+
+```
+
+
+### NIH Model Matrix for Predictions
+
+``` {r NewDataModelMatrix}
+
+NIHDataMatrix <- model.matrix(object = ~., data = NIH70kDataPCA[,-1]) #Building the model matrix on the data less the SMILE column
+NIHDataMatrix <- NIHDataMatrix[,-1] #Removing the intercept column
+
+#Predictions wont work if the columns are in a different order than the coefficients in the model itself. This reorders the columns in the data matrix to match that of the coefficients in the model
+NIHDataMatrix <- NIHDataMatrix[, match(tunedModelList[[1]]$coefnames, colnames(NIHDataMatrix))]
+
+
+```
+
+## NIH Data Predictions
+
+``` {r newDataPredictions}
+
+predListNIH70K <- list()
+
+for (i in seq(1:length(tunedModelList))){
+  tempPred<-predict(tunedModelList[[i]]$finalModel, newdata = NIHDataMatrix)
+  predListNIH70K[[i]] <- tempPred
+}
+
+averagePredListNIH70k <- list()
+
+for(i in seq(1:nrow(NIH70kDataPCA))){
+  runningTotal <- 0
+  
+  for(k in seq(1:length(predListNIH70K))){
+    runningTotal <- runningTotal + predListNIH70K[[k]][i]
+  }
+  averagePred <- runningTotal / length(predListNIH70K)
+  averagePredListNIH70k[[i]] <- averagePred
+  
+}
+
+finalPredictions <- data.frame(do.call(rbind, averagePredListNIH70k))
+
+NIH70KPredictions <- NIH70kData
+NIH70KPredictions$prob1 <- finalPredictions 
+
+
+PubChemSID <- vroom("C:\\MUChemistry\\DataSets\\02-28-2020-Second library from NIH.txt", 
+                    col_names = c("PubChem_SID", "SMILE"))
+
+NIH70KPredictions <- cbind(PubChemSID$PubChem_SID,NIH70KPredictions)
+
+
+## Subsetting the data set for compounds above our threshold from the first model 
+
+NIH70kDataForTesting <- subset(NIH70KPredictions, prob1 > .525) %>%
+  select(`PubChemSID$PubChem_SID`, SMILE, prob1)
+
+NIH70kDataForTesting<-NIH70kDataForTesting[order(-NIH70kDataForTesting$prob1),]
+NIH70kDataForTesting <- cbind(NIH70kDataForTesting,
+                              as.vector(seq(1:nrow(NIH70kDataForTesting))))
+
+colnames(NIH70kDataForTesting) <- c("PubChemSID","SMILE", "Probability", "Rank")
+
+
+NIH70kDataFull <- select(NIH70KPredictions, `PubChemSID$PubChem_SID`, SMILE, prob1)
+
+NIH70kDataFull<- NIH70kDataFull[order(-NIH70kDataFull$prob1),]
+NIH70kDataFull <- cbind(NIH70kDataFull,
+                              as.vector(seq(1:nrow(NIH70kDataFull))))
+
+NIH70kDataFull %<>% data.frame()
+
+colnames(NIH70kDataFull) <- c("PubChemSID","SMILE", "Probability", "Rank")
+
+
+NIH70kDataForTesting %<>% as.data.frame()
+NIH70kDataForTesting$Probability %<>% as.list()
+NIH70kDataForTesting$Probability <-
+  NIH70kDataForTesting$Probability$do.call.rbind..averagePredListNIH70k.
+vroom_write(NIH70kDataForTesting, "C:\\MUChemistry\\Models\\NIH70kDataForTesting.csv", delim = ",")
+
+NIH70kDataFull %<>% as.data.frame()
+NIH70kDataFull$Probability %<>% as.list()
+NIH70kDataFull$Probability <- NIH70kDataFull$Probability$do.call.rbind..averagePredListNIH70k.
+
+vroom_write(NIH70kDataFull, "C:\\MUChemistry\\Models\\NIH70kDataFull.csv", delim = ",")
+
+```f
